@@ -14,6 +14,7 @@ type UiEdges = {
   flashlightToggle: boolean;
   voicePressed: boolean;
   voiceReleased: boolean;
+  scan: boolean;
 };
 
 // Edges drained only when an input message is sent to the server.
@@ -39,6 +40,7 @@ export class InputController {
     flashlightToggle: false,
     voicePressed: false,
     voiceReleased: false,
+    scan: false,
   };
   private netEdges: NetEdges = { interact: false, drop: false };
   private canvas: HTMLCanvasElement | null = null;
@@ -72,6 +74,8 @@ export class InputController {
   private onMouseDown = (e: MouseEvent) => {
     if (this.uiHasFocus()) return;
     if (e.button === 0) this.netEdges.interact = true;
+    // Right-click triggers a client-side scan (item names + values in sight)
+    if (e.button === 2) this.uiEdges.scan = true;
   };
 
   private onKey = (e: KeyboardEvent) => {
@@ -167,6 +171,7 @@ export class InputController {
     this.uiEdges.flashlightToggle = false;
     this.uiEdges.voicePressed = false;
     this.uiEdges.voiceReleased = false;
+    this.uiEdges.scan = false;
     return out;
   }
 

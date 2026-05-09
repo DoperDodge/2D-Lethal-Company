@@ -28,7 +28,7 @@ export function App() {
   }, [socket]);
 
   const inLobby = !!stateRef.current.lobbyCode;
-  const inGame = inLobby && (stateRef.current.shipGrid || stateRef.current.facilityGrid);
+  const inGame = inLobby && stateRef.current.grid != null;
 
   return (
     <div className="game-root">

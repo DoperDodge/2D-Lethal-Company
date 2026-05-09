@@ -1,16 +1,5 @@
-import {
-  BUNKER_H,
-  BUNKER_INSET,
-  BUNKER_W,
-  FACILITY_H,
-  FACILITY_W,
-  ITEMS,
-  MOONS,
-  MonsterKind,
-  SCRAP_ITEMS,
-  TileType,
-} from "@quota/shared";
-import type { Monster, ScrapInstance, ItemInstance, TileGrid, Vec2 } from "@quota/shared";
+import { ITEMS, MOONS, MonsterKind, SCRAP_ITEMS, TileType } from "@quota/shared";
+import type { Monster, ScrapInstance, TileGrid, Vec2 } from "@quota/shared";
 import { makeRng, rngInt, rngPick } from "./rng.js";
 import { setTile, tileAt } from "../world/grid.js";
 
@@ -29,61 +18,60 @@ const newId = () => nextEntityId++;
 export type GeneratedFacility = {
   scene: TileGrid;
   scrap: ScrapInstance[];
-  items: ItemInstance[];
   monsters: Monster[];
-  shipExit: Vec2; // landing pad center (outdoors)
-  entrance: Vec2; // bunker main door (where exterior meets interior)
+  // Interior side of the entrance — where players spawn when entering and
+  // re-emerge on (so they exit cleanly back to the surface).
+  entrance: Vec2;
+  seed: number;
 };
 
-const BUNKER_X0 = BUNKER_INSET;
-const BUNKER_Y0 = BUNKER_INSET;
-const BUNKER_X1 = BUNKER_INSET + BUNKER_W - 1;
-const BUNKER_Y1 = BUNKER_INSET + BUNKER_H - 1;
-const ENTRANCE_X = Math.floor(FACILITY_W / 2);
-const ENTRANCE_Y = BUNKER_Y1; // south wall of bunker
-const LANDING_PAD_CY = BUNKER_Y1 + 7; // 7 tiles south of entrance
+const W = 60;
+const H = 60;
 
-export function generateFacility(moonId: string, seed: number): GeneratedFacility {
+/**
+ * Procgen interior bunker. Re-rolled with a fresh random seed every time the
+ * crew enters so two visits never feel the same.
+ *
+ * Layout: a closed rectangular bunker with N random rooms connected by
+ * 2-wide L-shaped corridors. The entrance is a 2-tile gap on the south wall;
+ * a corridor links it to the closest room.
+ */
+export function generateFacility(moonId: string): GeneratedFacility {
+  // Each generation gets a fresh random seed — no determinism per moon/day.
+  const seed = (Math.random() * 0xffffffff) >>> 0;
   const moon = MOONS[moonId] ?? MOONS["experimentation"]!;
-  for (let attempt = 0; attempt < 5; attempt++) {
+
+  for (let attempt = 0; attempt < 6; attempt++) {
     const rng = makeRng(seed + attempt * 7919);
-    const result = tryGenerate(moon, rng);
+    const result = tryGenerate(moon, rng, seed + attempt);
     if (result) return result;
   }
-  return fallbackFacility();
+  return fallbackFacility(seed);
 }
 
 function tryGenerate(
   moon: { id: string; scrapMin: number; scrapMax: number; monsterBudget: number },
   rng: () => number,
+  seed: number,
 ): GeneratedFacility | null {
-  const w = FACILITY_W;
-  const h = FACILITY_H;
-  const tiles = new Uint8Array(w * h);
-  const grid: TileGrid = { w, h, tiles };
+  const tiles = new Uint8Array(W * H);
+  tiles.fill(TileType.Wall);
+  const grid: TileGrid = { w: W, h: H, tiles };
 
-  // 1. Fill the entire map with exterior surface
-  tiles.fill(TileType.Exterior);
+  // South-wall entrance position (mirrors the surface's facility-entrance)
+  const entranceCx = Math.floor(W / 2);
+  const entranceY = H - 1;
 
-  // 2. Scatter exterior rocks for visual interest, biased away from the path
-  scatterExteriorRocks(grid, rng);
-
-  // 3. Carve the bunker footprint: walls on perimeter, walls on interior (will be overwritten by rooms)
-  for (let y = BUNKER_Y0; y <= BUNKER_Y1; y++) {
-    for (let x = BUNKER_X0; x <= BUNKER_X1; x++) {
-      setTile(grid, x, y, TileType.Wall);
-    }
-  }
-
-  // 4. Procgen rooms inside the bunker
-  const numRooms = rngInt(rng, 8, 12);
+  // Place rooms
+  const numRooms = rngInt(rng, 9, 14);
   const rooms: Room[] = [];
-  // Always reserve a "lobby" room near the entrance
-  const lobbyW = rngInt(rng, 6, 8);
-  const lobbyH = rngInt(rng, 5, 7);
+
+  // Always reserve a "lobby" room near the south entrance
+  const lobbyW = rngInt(rng, 6, 9);
+  const lobbyH = rngInt(rng, 5, 8);
   const lobby: Room = {
-    x: ENTRANCE_X - Math.floor(lobbyW / 2),
-    y: BUNKER_Y1 - lobbyH - 1,
+    x: entranceCx - Math.floor(lobbyW / 2),
+    y: H - lobbyH - 3,
     w: lobbyW,
     h: lobbyH,
     cx: 0,
@@ -92,24 +80,24 @@ function tryGenerate(
   lobby.cx = Math.floor(lobby.x + lobby.w / 2);
   lobby.cy = Math.floor(lobby.y + lobby.h / 2);
   if (
-    lobby.x < BUNKER_X0 + 1 ||
-    lobby.y < BUNKER_Y0 + 1 ||
-    lobby.x + lobby.w > BUNKER_X1 ||
-    lobby.y + lobby.h > BUNKER_Y1
+    lobby.x < 2 ||
+    lobby.y < 2 ||
+    lobby.x + lobby.w > W - 2 ||
+    lobby.y + lobby.h > H - 2
   ) {
     return null;
   }
   rooms.push(lobby);
   carveRoom(grid, lobby);
 
-  // Place additional rooms inside the bunker, avoiding overlap with reserved rooms
-  let placeAttempts = 0;
-  while (rooms.length < numRooms && placeAttempts < 250) {
-    placeAttempts++;
-    const rw = rngInt(rng, 5, 9);
+  // Random additional rooms
+  let attempts = 0;
+  while (rooms.length < numRooms && attempts < 250) {
+    attempts++;
+    const rw = rngInt(rng, 5, 10);
     const rh = rngInt(rng, 5, 9);
-    const rx = rngInt(rng, BUNKER_X0 + 1, BUNKER_X1 - rw - 1);
-    const ry = rngInt(rng, BUNKER_Y0 + 1, BUNKER_Y1 - rh - 1);
+    const rx = rngInt(rng, 2, W - rw - 2);
+    const ry = rngInt(rng, 2, H - rh - 2);
     const room: Room = {
       x: rx,
       y: ry,
@@ -122,10 +110,9 @@ function tryGenerate(
     rooms.push(room);
     carveRoom(grid, room);
   }
+  if (rooms.length < 5) return null;
 
-  if (rooms.length < 4) return null;
-
-  // 5. Connect rooms with L-corridors in placement order
+  // Connect rooms with L-corridors in placement order
   for (let i = 1; i < rooms.length; i++) {
     const a = rooms[i - 1]!;
     const b = rooms[i]!;
@@ -138,37 +125,25 @@ function tryGenerate(
     }
   }
 
-  // 6. Carve the entrance door on the south bunker wall, connecting exterior to lobby
-  setTile(grid, ENTRANCE_X, ENTRANCE_Y, TileType.FacilityEntrance);
-  setTile(grid, ENTRANCE_X + 1, ENTRANCE_Y, TileType.FacilityEntrance);
-  // Make sure the lobby connects to the entrance (carve a small corridor if needed)
-  for (let y = lobby.y + lobby.h; y <= ENTRANCE_Y; y++) {
-    setTile(grid, ENTRANCE_X, y, TileType.Floor);
-    setTile(grid, ENTRANCE_X + 1, y, TileType.Floor);
-  }
-  setTile(grid, ENTRANCE_X, ENTRANCE_Y, TileType.FacilityEntrance);
-  setTile(grid, ENTRANCE_X + 1, ENTRANCE_Y, TileType.FacilityEntrance);
-
-  // 7. Connectivity check: every room must be reachable from the entrance
-  if (!isConnected(grid, rooms, { x: ENTRANCE_X, y: ENTRANCE_Y - 1 })) return null;
-
-  // 8. Carve the landing pad on the exterior, south of the entrance
-  carveLandingPad(grid, ENTRANCE_X, LANDING_PAD_CY);
-  // Clear a path from landing pad to entrance so rocks don't block movement
-  for (let y = ENTRANCE_Y + 1; y < LANDING_PAD_CY - 2; y++) {
-    setTile(grid, ENTRANCE_X, y, TileType.Exterior);
-    setTile(grid, ENTRANCE_X + 1, y, TileType.Exterior);
-    setTile(grid, ENTRANCE_X - 1, y, TileType.Exterior);
-    setTile(grid, ENTRANCE_X + 2, y, TileType.Exterior);
+  // South-wall entrance, two tiles wide
+  setTile(grid, entranceCx, entranceY, TileType.FacilityEntrance);
+  setTile(grid, entranceCx + 1, entranceY, TileType.FacilityEntrance);
+  // Carve a short corridor from entrance to lobby
+  for (let y = lobby.y + lobby.h; y < entranceY; y++) {
+    setTile(grid, entranceCx, y, TileType.Floor);
+    setTile(grid, entranceCx + 1, y, TileType.Floor);
   }
 
-  // 9. Add a couple of decorative doors at room boundaries
+  // Connectivity check from entrance interior
+  if (!isConnected(grid, rooms, { x: entranceCx, y: entranceY - 1 })) return null;
+
+  // Add a few random doors at room boundaries for character
   for (let i = 1; i < rooms.length; i++) {
     const r = rooms[i]!;
-    if (rng() < 0.35) setTile(grid, r.cx, r.y, TileType.Door);
+    if (rng() < 0.3) setTile(grid, r.cx, r.y, TileType.Door);
   }
 
-  // 10. Scrap placement — interior rooms only, biased away from lobby
+  // Scrap placement (avoid the lobby so the start area is empty)
   const scrapCount = rngInt(rng, moon.scrapMin, moon.scrapMax);
   const scrap: ScrapInstance[] = [];
   for (let i = 0; i < scrapCount; i++) {
@@ -188,7 +163,7 @@ function tryGenerate(
     });
   }
 
-  // 11. Monster placement — far from the lobby
+  // Monster placement — far from the lobby
   const monsters: Monster[] = [];
   for (let i = 0; i < moon.monsterBudget; i++) {
     const room = rooms[rngInt(rng, Math.max(1, rooms.length - 4), rooms.length - 1)]!;
@@ -206,60 +181,15 @@ function tryGenerate(
   return {
     scene: grid,
     scrap,
-    items: [],
     monsters,
-    shipExit: { x: ENTRANCE_X + 0.5, y: LANDING_PAD_CY + 0.5 },
-    entrance: { x: ENTRANCE_X + 0.5, y: ENTRANCE_Y + 0.5 },
+    entrance: { x: entranceCx + 0.5, y: entranceY - 0.5 },
+    seed,
   };
-}
-
-function scatterExteriorRocks(g: TileGrid, rng: () => number): void {
-  // Border the map with a ring of rocks (impassable map edge)
-  for (let x = 0; x < g.w; x++) {
-    setTile(g, x, 0, TileType.ExteriorRock);
-    setTile(g, x, g.h - 1, TileType.ExteriorRock);
-  }
-  for (let y = 0; y < g.h; y++) {
-    setTile(g, 0, y, TileType.ExteriorRock);
-    setTile(g, g.w - 1, y, TileType.ExteriorRock);
-  }
-  // Random scattered rocks across the exterior (leave a margin around bunker)
-  const total = g.w * g.h;
-  const targetRocks = Math.floor(total * 0.04);
-  let placed = 0;
-  let attempts = 0;
-  while (placed < targetRocks && attempts < targetRocks * 10) {
-    attempts++;
-    const x = rngInt(rng, 1, g.w - 2);
-    const y = rngInt(rng, 1, g.h - 2);
-    // Keep area between landing pad and entrance clear
-    if (x >= BUNKER_X0 - 1 && x <= BUNKER_X1 + 1 && y >= BUNKER_Y0 - 1 && y <= BUNKER_Y1 + 1) continue;
-    if (
-      Math.abs(x - ENTRANCE_X) < 4 &&
-      y > BUNKER_Y1 &&
-      y < LANDING_PAD_CY + 4
-    ) {
-      continue;
-    }
-    if (g.tiles[y * g.w + x] !== TileType.Exterior) continue;
-    setTile(g, x, y, TileType.ExteriorRock);
-    placed++;
-  }
-}
-
-function carveLandingPad(g: TileGrid, cx: number, cy: number): void {
-  // 5x5 pad with painted hazard markings
-  for (let dy = -2; dy <= 2; dy++) {
-    for (let dx = -2; dx <= 2; dx++) {
-      setTile(g, cx + dx, cy + dy, TileType.LandingPad);
-    }
-  }
 }
 
 function roomsOverlap(a: Room, b: Room, pad: number): boolean {
   return !(a.x + a.w + pad <= b.x || b.x + b.w + pad <= a.x || a.y + a.h + pad <= b.y || b.y + b.h + pad <= a.y);
 }
-
 function carveRoom(g: TileGrid, r: Room): void {
   for (let y = r.y; y < r.y + r.h; y++) {
     for (let x = r.x; x < r.x + r.w; x++) {
@@ -283,7 +213,6 @@ function carveVCorridor(g: TileGrid, y1: number, y2: number, x: number): void {
     setTile(g, x + 1, y, TileType.Floor);
   }
 }
-
 function isConnected(g: TileGrid, rooms: Room[], from: { x: number; y: number }): boolean {
   const seen = new Uint8Array(g.w * g.h);
   const q: number[] = [from.y * g.w + from.x];
@@ -316,38 +245,25 @@ function isConnected(g: TileGrid, rooms: Room[], from: { x: number; y: number })
   }
   return true;
 }
-
-function fallbackFacility(): GeneratedFacility {
-  const w = FACILITY_W;
-  const h = FACILITY_H;
-  const tiles = new Uint8Array(w * h);
-  tiles.fill(TileType.Exterior);
-  const grid: TileGrid = { w, h, tiles };
-  // Map border
-  for (let x = 0; x < w; x++) {
-    setTile(grid, x, 0, TileType.ExteriorRock);
-    setTile(grid, x, h - 1, TileType.ExteriorRock);
+function fallbackFacility(seed: number): GeneratedFacility {
+  const tiles = new Uint8Array(W * H);
+  tiles.fill(TileType.Wall);
+  const grid: TileGrid = { w: W, h: H, tiles };
+  const room: Room = { x: 4, y: 4, w: W - 8, h: H - 8, cx: Math.floor(W / 2), cy: Math.floor(H / 2) };
+  carveRoom(grid, room);
+  const entranceCx = Math.floor(W / 2);
+  const entranceY = H - 1;
+  setTile(grid, entranceCx, entranceY, TileType.FacilityEntrance);
+  setTile(grid, entranceCx + 1, entranceY, TileType.FacilityEntrance);
+  for (let y = room.y + room.h; y < entranceY; y++) {
+    setTile(grid, entranceCx, y, TileType.Floor);
+    setTile(grid, entranceCx + 1, y, TileType.Floor);
   }
-  for (let y = 0; y < h; y++) {
-    setTile(grid, 0, y, TileType.ExteriorRock);
-    setTile(grid, w - 1, y, TileType.ExteriorRock);
-  }
-  // One open bunker
-  for (let y = BUNKER_Y0; y <= BUNKER_Y1; y++) {
-    for (let x = BUNKER_X0; x <= BUNKER_X1; x++) {
-      const onEdge = x === BUNKER_X0 || x === BUNKER_X1 || y === BUNKER_Y0 || y === BUNKER_Y1;
-      setTile(grid, x, y, onEdge ? TileType.Wall : TileType.Floor);
-    }
-  }
-  setTile(grid, ENTRANCE_X, ENTRANCE_Y, TileType.FacilityEntrance);
-  setTile(grid, ENTRANCE_X + 1, ENTRANCE_Y, TileType.FacilityEntrance);
-  carveLandingPad(grid, ENTRANCE_X, LANDING_PAD_CY);
   return {
     scene: grid,
     scrap: [],
-    items: [],
     monsters: [],
-    shipExit: { x: ENTRANCE_X + 0.5, y: LANDING_PAD_CY + 0.5 },
-    entrance: { x: ENTRANCE_X + 0.5, y: ENTRANCE_Y + 0.5 },
+    entrance: { x: entranceCx + 0.5, y: entranceY - 0.5 },
+    seed,
   };
 }

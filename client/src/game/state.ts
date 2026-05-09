@@ -4,12 +4,11 @@ import type {
   Monster,
   PlayerId,
   PlayerState,
+  Scene,
   ScrapInstance,
   ServerMsg,
   TileGrid,
-  Vec2,
 } from "@quota/shared";
-import { LANDING_CUTSCENE_MS, Scene } from "@quota/shared";
 
 export type SnapEntry = { snap: GameSnapshot; recvAt: number };
 
@@ -18,24 +17,25 @@ export type ClientGameState = {
   lobbyCode: string | null;
   lobbyRoster: { id: PlayerId; name: string; color: string; ready: boolean }[];
   phase: GameSnapshot["phase"] | "lobby";
-  shipGrid: TileGrid | null;
-  facilityGrid: TileGrid | null;
-  facilityLandingPad: Vec2 | null;
-  facilityEntrance: Vec2 | null;
+  // Active scene rendered by the client (the player's current scene).
+  scene: Scene | null;
+  grid: TileGrid | null;
+  moonId: string | null;
+  moonName: string | null;
   // Snapshot buffer for interpolation
   snapBuffer: SnapEntry[];
-  // Most recent display-time interpolated snapshot (built by GameView each frame)
   displaySnap: GameSnapshot | null;
   // Chat
   chatLog: { from: PlayerId; fromName: string; text: string; channel: "proximity" | "ship" | "system"; ts: number }[];
-  // Voice peers (player ids who are actively transmitting)
   voicePeers: Set<PlayerId>;
-  // Day-end / game-over toasts
+  // Toasts
   toast: string | null;
   toastUntil: number;
   // Landing cutscene
   cutsceneEndsAt: number;
   cutsceneMoonName: string | null;
+  // Open-terminal request from the server (pressed E on console)
+  shouldOpenTerminal: boolean;
 };
 
 export function newState(): ClientGameState {
@@ -44,10 +44,10 @@ export function newState(): ClientGameState {
     lobbyCode: null,
     lobbyRoster: [],
     phase: "lobby",
-    shipGrid: null,
-    facilityGrid: null,
-    facilityLandingPad: null,
-    facilityEntrance: null,
+    scene: null,
+    grid: null,
+    moonId: null,
+    moonName: null,
     snapBuffer: [],
     displaySnap: null,
     chatLog: [],
@@ -56,6 +56,7 @@ export function newState(): ClientGameState {
     toastUntil: 0,
     cutsceneEndsAt: 0,
     cutsceneMoonName: null,
+    shouldOpenTerminal: false,
   };
 }
 
@@ -76,34 +77,30 @@ export function applyServerMsg(s: ClientGameState, msg: ServerMsg): void {
     case "lobby_left":
       s.lobbyCode = null;
       s.lobbyRoster = [];
-      s.shipGrid = null;
-      s.facilityGrid = null;
+      s.scene = null;
+      s.grid = null;
       s.snapBuffer = [];
       s.displaySnap = null;
       s.phase = "lobby";
       return;
-    case "scene_ship":
-      s.shipGrid = msg.ship.scene;
-      s.facilityGrid = null;
-      s.facilityLandingPad = null;
-      s.facilityEntrance = null;
-      // Drop snapshot buffer when scene changes — entities in old scene are gone
+    case "scene_change":
+      s.scene = msg.scene;
+      s.grid = msg.grid;
+      s.moonId = msg.moonId ?? s.moonId;
+      s.moonName = msg.moonName ?? s.moonName;
+      // Drop interpolation buffer — entities in the old scene aren't relevant
       s.snapBuffer = [];
       s.displaySnap = null;
       return;
-    case "scene_facility":
-      s.facilityGrid = msg.facility.scene;
-      s.facilityLandingPad = msg.facility.shipExit;
-      s.facilityEntrance = msg.facility.entrance ?? null;
-      s.snapBuffer = [];
-      s.displaySnap = null;
-      // Trigger client-side landing cutscene
-      s.cutsceneEndsAt = Date.now() + LANDING_CUTSCENE_MS;
-      s.cutsceneMoonName = msg.facility.moonName ?? msg.facility.moonId ?? "";
+    case "cutscene_begin":
+      s.cutsceneEndsAt = Date.now() + msg.durationMs;
+      s.cutsceneMoonName = msg.moonName;
+      return;
+    case "open_terminal":
+      s.shouldOpenTerminal = true;
       return;
     case "snapshot":
       s.snapBuffer.push({ snap: msg.snap, recvAt: Date.now() });
-      // Keep last ~6 snapshots (300ms window)
       if (s.snapBuffer.length > 6) s.snapBuffer.splice(0, s.snapBuffer.length - 6);
       return;
     case "chat":
@@ -121,7 +118,7 @@ export function applyServerMsg(s: ClientGameState, msg: ServerMsg): void {
       else s.voicePeers.delete(msg.playerId);
       return;
     case "day_end":
-      s.toast = `Day ended — ${msg.scrapTotal} credits stowed`;
+      s.toast = `Day ended — ${msg.scrapTotal} scrap pieces stowed`;
       s.toastUntil = Date.now() + 4000;
       return;
     case "game_over":
@@ -142,26 +139,18 @@ export function getMyPlayer(s: ClientGameState): PlayerState | null {
 }
 
 export function activeGrid(s: ClientGameState): TileGrid | null {
-  const me = getMyPlayer(s);
-  if (!me) return s.shipGrid;
-  return me.scene === Scene.Ship ? s.shipGrid : s.facilityGrid;
+  return s.grid;
 }
 
 export function latestSnap(s: ClientGameState): GameSnapshot | null {
   return s.snapBuffer.length ? s.snapBuffer[s.snapBuffer.length - 1]!.snap : null;
 }
 
-/**
- * Build an interpolated snapshot for the current render time.
- * renderTime should be `Date.now() - SNAPSHOT_RENDER_DELAY_MS`.
- * Returns the latest snapshot if there's only one, or interpolated otherwise.
- */
 export function buildDisplaySnap(s: ClientGameState, renderTime: number): GameSnapshot | null {
   const buf = s.snapBuffer;
   if (buf.length === 0) return null;
   if (buf.length === 1) return buf[0]!.snap;
 
-  // Find the two snapshots surrounding renderTime
   let prev = buf[0]!;
   let next = buf[buf.length - 1]!;
   for (let i = 0; i < buf.length - 1; i++) {
@@ -173,21 +162,17 @@ export function buildDisplaySnap(s: ClientGameState, renderTime: number): GameSn
       break;
     }
   }
-  // If renderTime is before earliest, use the earliest pair
   if (renderTime < buf[0]!.recvAt) {
     prev = buf[0]!;
     next = buf[1]!;
   }
-  // If renderTime is past latest, extrapolate from last pair (clamped to t=1)
   if (renderTime > next.recvAt) {
     prev = buf[buf.length - 2]!;
     next = buf[buf.length - 1]!;
   }
-
   const span = Math.max(1, next.recvAt - prev.recvAt);
   const t = Math.max(0, Math.min(1, (renderTime - prev.recvAt) / span));
 
-  // Interpolate position-bearing entities; non-positional fields use `next`.
   const players = next.snap.players.map((p) => {
     const old = prev.snap.players.find((x) => x.id === p.id);
     if (!old) return p;
@@ -206,7 +191,6 @@ export function buildDisplaySnap(s: ClientGameState, renderTime: number): GameSn
       facing: lerpAngle(old.facing, m.facing, t),
     };
   });
-  // Scrap and items rarely move (only when carried/dropped) — interpolate too
   const scrap: ScrapInstance[] = next.snap.scrap.map((sc) => {
     const old = prev.snap.scrap.find((x) => x.id === sc.id);
     if (!old) return sc;
@@ -223,7 +207,6 @@ export function buildDisplaySnap(s: ClientGameState, renderTime: number): GameSn
 function lerp(a: number, b: number, t: number): number {
   return a + (b - a) * t;
 }
-
 function lerpAngle(a: number, b: number, t: number): number {
   let diff = b - a;
   while (diff > Math.PI) diff -= 2 * Math.PI;

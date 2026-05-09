@@ -3,10 +3,11 @@ import {
   DAY_LENGTH_SECONDS,
   DEFAULT_MOON_ID,
   DOOR_CLOSE_WARNING_SEC,
+  ITEMS,
   LANDING_CUTSCENE_MS,
+  MOONS,
   PLAYER_INVENTORY_SLOTS,
   PLAYER_MAX_HEALTH,
-  PLAYER_SPEED,
   PROXIMITY_TEXT_RADIUS,
   QUOTA_INCREMENT,
   Scene,
@@ -14,8 +15,6 @@ import {
   STARTING_QUOTA,
   TICK_MS,
   TileType,
-  ITEMS,
-  MOONS,
 } from "@quota/shared";
 import type {
   ClientMsg,
@@ -33,10 +32,21 @@ import type {
   Vec2,
 } from "@quota/shared";
 import type { ClientCtx } from "../net/connection.js";
-import { generateShip } from "../world/ship.js";
-import { generateFacility } from "../procgen/facility.js";
+import { generateShip, type ShipScene } from "../world/ship.js";
+import { generateAtriumSurface, generateExperimentationSurface, type SurfaceScene } from "../world/surface.js";
+import { generateCompanyInterior, type CompanyScene } from "../world/company.js";
+import { generateFacility, type GeneratedFacility } from "../procgen/facility.js";
 import { stepMonster } from "../world/monster.js";
-import { tileAt, isWalkable, lineOfSight } from "../world/grid.js";
+import { isWalkable, lineOfSight, tileAt } from "../world/grid.js";
+
+// One scene's authoritative state. Players are tracked in a flat map but
+// each carries a `scene` field; entities in `entities` belong to that scene.
+type SceneInstance = {
+  grid: TileGrid;
+  scrap: ScrapInstance[];
+  items: ItemInstance[];
+  monsters: Monster[];
+};
 
 type LobbyPlayer = {
   ctx: ClientCtx;
@@ -58,6 +68,11 @@ type LobbyPlayer = {
 let nextEntityId = 1;
 const newEntityId = () => nextEntityId++;
 
+function buildSurface(moonId: string): SurfaceScene {
+  if (moonId === "experimentation") return generateExperimentationSurface();
+  return generateAtriumSurface();
+}
+
 export class Lobby {
   readonly code: LobbyCode;
   private maxPlayers: number;
@@ -65,50 +80,66 @@ export class Lobby {
   private phase: LobbyPhase = "lobby";
   private tick_n = 0;
 
-  // World scenes
-  private ship: TileGrid;
-  private shipSpawn: Vec2;
-  private facility: ReturnType<typeof generateFacility> | null = null;
+  // Persistent ship interior + dropped items inside it (carry across launches)
+  private shipScene: ShipScene;
+  private shipState: SceneInstance;
+  // Sell building interior — only meaningful when on Atrium
+  private companyScene: CompanyScene;
+  private companyState: SceneInstance;
+  // Current moon's outdoor surface (regenerated when moon changes)
+  private surfaceScene: SurfaceScene;
+  private surfaceState: SceneInstance;
+  // Procgen interior (only valid when current moon has a facility, regenerated per launch)
+  private interiorScene: GeneratedFacility | null = null;
+  private interiorState: SceneInstance | null = null;
+
   private moonId: string = DEFAULT_MOON_ID;
 
   // Day/quota
   private dayNumber = 1;
   private daysRemaining = DAYS_PER_QUOTA_CYCLE;
   private quota = STARTING_QUOTA;
-  private scrapSold = 0;
   private credits = STARTING_CREDITS;
   private timeRemaining = DAY_LENGTH_SECONDS;
   private warnedDoorClose = false;
-  // Tick at which the landing cutscene ends and free movement begins.
   private landingEndsAtTick = 0;
 
   constructor(code: LobbyCode, maxPlayers: number) {
     this.code = code;
     this.maxPlayers = maxPlayers;
-    const { grid, spawn } = generateShip();
-    this.ship = grid;
-    this.shipSpawn = spawn;
+    this.shipScene = generateShip();
+    this.shipState = { grid: this.shipScene.grid, scrap: [], items: [], monsters: [] };
+    this.companyScene = generateCompanyInterior();
+    this.companyState = { grid: this.companyScene.grid, scrap: [], items: [], monsters: [] };
+    this.surfaceScene = buildSurface(this.moonId);
+    this.surfaceState = { grid: this.surfaceScene.grid, scrap: [], items: [], monsters: [] };
   }
 
-  isEmpty(): boolean {
-    return this.players.size === 0;
-  }
-  isFull(): boolean {
-    return this.players.size >= this.maxPlayers;
-  }
+  isEmpty(): boolean { return this.players.size === 0; }
+  isFull(): boolean { return this.players.size >= this.maxPlayers; }
 
   addPlayer(ctx: ClientCtx): void {
+    // Default: every contractor gets a flashlight on lobby join. Without this
+    // pressing F does nothing because the server requires the item in inventory.
+    const inventory: (ItemInstance | null)[] = new Array(PLAYER_INVENTORY_SLOTS).fill(null);
+    inventory[0] = {
+      id: newEntityId(),
+      itemId: "flashlight",
+      pos: { x: 0, y: 0 },
+      carriedBy: ctx.id,
+    };
+
     const state: PlayerState = {
       id: ctx.id,
       name: ctx.name,
       color: ctx.color,
-      pos: { x: this.shipSpawn.x, y: this.shipSpawn.y },
-      facing: 0,
+      pos: { x: this.shipScene.innerSpawn.x, y: this.shipScene.innerSpawn.y },
+      facing: -Math.PI / 2,
       vel: { x: 0, y: 0 },
       hp: PLAYER_MAX_HEALTH,
       alive: true,
       scene: Scene.Ship,
-      inventory: new Array(PLAYER_INVENTORY_SLOTS).fill(null),
+      inventory,
       selectedSlot: 0,
       flashlightOn: false,
       credits: this.credits,
@@ -124,15 +155,13 @@ export class Lobby {
     };
     this.players.set(ctx.id, lp);
 
-    // Tell joining player they're in
     ctx.send({
       t: "lobby_joined",
       code: this.code,
       you: ctx.id,
       players: this.lobbyRoster(),
     });
-    ctx.send({ t: "scene_ship", ship: { scene: this.ship } });
-
+    this.sendSceneToPlayer(lp);
     this.broadcastLobbyUpdate();
     this.systemMessage(`${state.name} joined`);
   }
@@ -143,7 +172,6 @@ export class Lobby {
     this.players.delete(playerId);
     this.systemMessage(`${lp.state.name} left`);
     this.broadcastLobbyUpdate();
-    // Tell remaining peers to drop voice connections
     this.broadcast({ t: "peer_voice", playerId, on: false });
   }
 
@@ -184,10 +212,12 @@ export class Lobby {
         }
         return;
       case "launch":
-        if (this.phase === "in_ship" || this.phase === "lobby") this.startLanding();
+        if (this.phase === "in_ship" || this.phase === "lobby" || this.phase === "in_facility") {
+          this.startLanding(this.moonId);
+        }
         return;
       case "return_to_orbit":
-        if (this.phase === "in_facility") this.returnToOrbit();
+        if (this.phase === "in_facility") this.returnToShip();
         return;
       case "signal":
         this.relaySignal(ctx.id, msg.toPlayerId, msg.payload);
@@ -210,7 +240,9 @@ export class Lobby {
       this.warnedDoorClose = false;
     }
 
-    if (this.phase === "in_facility") {
+    // Day timer only runs on industrial moons (those that have a facility).
+    const moon = MOONS[this.moonId];
+    if (this.phase === "in_facility" && moon?.hasFacility) {
       this.timeRemaining = Math.max(0, this.timeRemaining - dt);
       if (this.timeRemaining < DOOR_CLOSE_WARNING_SEC && !this.warnedDoorClose) {
         this.warnedDoorClose = true;
@@ -221,19 +253,19 @@ export class Lobby {
       }
     }
 
-    // Apply player inputs and step
     for (const lp of this.players.values()) {
       this.stepPlayer(lp, dt);
     }
 
-    // Step monsters (facility only)
-    if (this.facility) {
-      const playerList = [...this.players.values()].map((p) => p.state);
-      for (const m of this.facility.monsters) {
-        stepMonster(m, dt, this.facility.scene, playerList);
-        // Damage on contact
-        for (const p of playerList) {
-          if (!p.alive || p.scene !== Scene.Facility) continue;
+    // Step monsters in interior only (other scenes have none)
+    if (this.interiorState) {
+      const playersInInterior = [...this.players.values()]
+        .map((p) => p.state)
+        .filter((p) => p.scene === Scene.Interior);
+      for (const m of this.interiorState.monsters) {
+        stepMonster(m, dt, this.interiorState.grid, playersInInterior);
+        for (const p of playersInInterior) {
+          if (!p.alive) continue;
           const dx = p.pos.x - m.pos.x;
           const dy = p.pos.y - m.pos.y;
           if (dx * dx + dy * dy < 0.5 * 0.5) {
@@ -248,8 +280,7 @@ export class Lobby {
       }
     }
 
-    // Snapshot to all clients each tick
-    if (this.tick_n % 1 === 0) this.broadcastSnapshot();
+    this.broadcastSnapshot();
   }
 
   private stepPlayer(lp: LobbyPlayer, dt: number): void {
@@ -260,112 +291,164 @@ export class Lobby {
       p.vel.y = 0;
       return;
     }
-    // During landing cutscene, hold the player still on the landing pad.
+    // During landing cutscene, players are pinned inside the ship.
     if (this.phase === "landing") {
       p.vel.x = 0;
       p.vel.y = 0;
       if (inp) lp.lastInputSeq = inp.seq;
       return;
     }
-    let mvx = 0,
-      mvy = 0;
+    let mvx = 0, mvy = 0;
     if (inp) {
       mvx = inp.mv.x;
       mvy = inp.mv.y;
       p.facing = inp.facing;
-      const wantFlashlight = inp.flashlight;
-      // Flashlight needs item in inventory
-      if (wantFlashlight && hasItem(p, "flashlight")) {
-        p.flashlightOn = true;
-      } else {
-        p.flashlightOn = false;
-      }
+      // Flashlight: respects whether the player has one in inventory.
+      if (inp.flashlight && hasItem(p, "flashlight")) p.flashlightOn = true;
+      else p.flashlightOn = false;
       p.selectedSlot = inp.selectedSlot;
       lp.lastInputSeq = inp.seq;
       if (inp.interact) this.handleInteract(lp);
       if (inp.drop) this.handleDrop(lp);
     }
-    // Normalize movement vector
     const mag = Math.hypot(mvx, mvy);
-    if (mag > 1) {
-      mvx /= mag;
-      mvy /= mag;
-    }
-    const speed = PLAYER_SPEED;
+    if (mag > 1) { mvx /= mag; mvy /= mag; }
+    const speed = 4.0;
     const nx = p.pos.x + mvx * speed * dt;
     const ny = p.pos.y + mvy * speed * dt;
-    const grid = p.scene === Scene.Ship ? this.ship : this.facility?.scene;
-    if (grid) {
-      // Axis-separated collision so sliding works
-      if (isWalkable(grid, nx, p.pos.y)) p.pos.x = nx;
-      if (isWalkable(grid, p.pos.x, ny)) p.pos.y = ny;
+    const sceneInst = this.sceneFor(p.scene);
+    if (sceneInst) {
+      if (isWalkable(sceneInst.grid, nx, p.pos.y)) p.pos.x = nx;
+      if (isWalkable(sceneInst.grid, p.pos.x, ny)) p.pos.y = ny;
     }
     p.vel = { x: mvx * speed, y: mvy * speed };
-
-    // Carry scrap value mirrored
     p.credits = this.credits;
+  }
+
+  private sceneFor(scene: Scene): SceneInstance | null {
+    switch (scene) {
+      case Scene.Ship: return this.shipState;
+      case Scene.Surface: return this.surfaceState;
+      case Scene.Interior: return this.interiorState;
+      case Scene.Company: return this.companyState;
+      default: return null;
+    }
+  }
+
+  private transitionPlayer(lp: LobbyPlayer, toScene: Scene, pos: Vec2): void {
+    lp.state.scene = toScene;
+    lp.state.pos = { x: pos.x, y: pos.y };
+    this.sendSceneToPlayer(lp);
+  }
+
+  private sendSceneToPlayer(lp: LobbyPlayer): void {
+    const sceneInst = this.sceneFor(lp.state.scene);
+    if (!sceneInst) return;
+    const moon = MOONS[this.moonId];
+    lp.ctx.send({
+      t: "scene_change",
+      scene: lp.state.scene,
+      grid: sceneInst.grid,
+      moonId: this.moonId,
+      moonName: moon?.name,
+    });
   }
 
   private handleInteract(lp: LobbyPlayer): void {
     const p = lp.state;
-    if (p.scene === Scene.Ship) {
-      const tile = tileAt(this.ship, Math.floor(p.pos.x), Math.floor(p.pos.y));
-      if (tile === TileType.CompanyDesk) {
-        this.sellAllScrap();
-      } else if (tile === TileType.ShipExit) {
-        this.startLanding();
-      }
-      return;
-    }
-    if (p.scene === Scene.Facility && this.facility) {
-      // Pick up nearest scrap or item
-      const facility = this.facility;
-      let bestIdx = -1;
-      let bestDist = 1.2;
-      let bestKind: "scrap" | "item" = "scrap";
-      facility.scrap.forEach((s, i) => {
-        if (s.carriedBy) return;
-        const d = Math.hypot(s.pos.x - p.pos.x, s.pos.y - p.pos.y);
-        if (d < bestDist) {
-          bestDist = d;
-          bestIdx = i;
-          bestKind = "scrap";
-        }
-      });
-      facility.items.forEach((it, i) => {
-        if (it.carriedBy) return;
-        const d = Math.hypot(it.pos.x - p.pos.x, it.pos.y - p.pos.y);
-        if (d < bestDist) {
-          bestDist = d;
-          bestIdx = i;
-          bestKind = "item";
-        }
-      });
-      if (bestIdx >= 0) {
-        const slot = p.inventory.findIndex((s) => s === null);
-        if (slot < 0) {
-          this.dm(lp, "Inventory full.");
-          return;
-        }
-        if (bestKind === "scrap") {
-          const s = facility.scrap[bestIdx]!;
-          s.carriedBy = p.id;
-          p.inventory[slot] = { id: s.id, itemId: s.itemId, pos: { ...s.pos }, carriedBy: p.id };
-        } else {
-          const it = facility.items[bestIdx]!;
-          it.carriedBy = p.id;
-          p.inventory[slot] = { id: it.id, itemId: it.itemId, pos: { ...it.pos }, carriedBy: p.id };
-        }
+    const sceneInst = this.sceneFor(p.scene);
+    if (!sceneInst) return;
+    const tx = Math.floor(p.pos.x);
+    const ty = Math.floor(p.pos.y);
+    const tileHere = tileAt(sceneInst.grid, tx, ty);
+
+    // Doors: pressing E on or directly adjacent to a door tile transitions
+    // between scenes. Stepping on the tile alone doesn't fire — the player
+    // chooses when to walk through.
+    if (tileHere === TileType.ShipDoor || tileAdjacent(sceneInst.grid, p.pos, TileType.ShipDoor)) {
+      if (p.scene === Scene.Ship) {
+        this.transitionPlayer(lp, Scene.Surface, this.surfaceScene.arrivalSpawn);
         return;
       }
-      // Or step on ship-exit pad to return to orbit
-      const exit = facility.shipExit;
-      if (Math.hypot(exit.x - p.pos.x, exit.y - p.pos.y) < 1.2) {
-        // bring carried scrap back to ship as sold inventory bank
-        this.depositPlayerScrap(lp);
-        p.scene = Scene.Ship;
-        p.pos = { x: this.shipSpawn.x, y: this.shipSpawn.y };
-        this.systemMessage(`${p.name} returned to orbit.`);
+      if (p.scene === Scene.Surface) {
+        this.transitionPlayer(lp, Scene.Ship, this.shipScene.innerSpawn);
+        return;
+      }
+    }
+    if (tileHere === TileType.FacilityEntrance || tileAdjacent(sceneInst.grid, p.pos, TileType.FacilityEntrance)) {
+      if (p.scene === Scene.Surface && this.interiorState && this.interiorScene) {
+        this.transitionPlayer(lp, Scene.Interior, this.interiorScene.entrance);
+        return;
+      }
+      if (p.scene === Scene.Interior && this.surfaceScene.facilityEntrance) {
+        const out = { x: this.surfaceScene.facilityEntrance.x, y: this.surfaceScene.facilityEntrance.y + 2 };
+        this.transitionPlayer(lp, Scene.Surface, out);
+        return;
+      }
+    }
+    if (tileHere === TileType.CompanyDoor || tileAdjacent(sceneInst.grid, p.pos, TileType.CompanyDoor)) {
+      if (p.scene === Scene.Surface && this.moonId === "atrium") {
+        this.transitionPlayer(lp, Scene.Company, this.companyScene.innerSpawn);
+        return;
+      }
+      if (p.scene === Scene.Company && this.surfaceScene.companyDoor) {
+        const out = { x: this.surfaceScene.companyDoor.x, y: this.surfaceScene.companyDoor.y + 1 };
+        this.transitionPlayer(lp, Scene.Surface, out);
+        return;
+      }
+    }
+
+    // Console / desk interactions
+    if (p.scene === Scene.Ship && tileAdjacent(sceneInst.grid, p.pos, TileType.ShipConsole)) {
+      lp.ctx.send({ t: "open_terminal" });
+      return;
+    }
+    if (p.scene === Scene.Company && tileAdjacent(sceneInst.grid, p.pos, TileType.CompanyDesk)) {
+      this.sellAllScrap();
+      return;
+    }
+
+    // Pickup nearest scrap or item in current scene
+    let bestIdx = -1;
+    let bestDist = 1.2;
+    let bestKind: "scrap" | "item" = "scrap";
+    sceneInst.scrap.forEach((s, i) => {
+      if (s.carriedBy) return;
+      const d = Math.hypot(s.pos.x - p.pos.x, s.pos.y - p.pos.y);
+      if (d < bestDist) {
+        bestDist = d;
+        bestIdx = i;
+        bestKind = "scrap";
+      }
+    });
+    sceneInst.items.forEach((it, i) => {
+      if (it.carriedBy) return;
+      const d = Math.hypot(it.pos.x - p.pos.x, it.pos.y - p.pos.y);
+      if (d < bestDist) {
+        bestDist = d;
+        bestIdx = i;
+        bestKind = "item";
+      }
+    });
+    if (bestIdx >= 0) {
+      const slot = p.inventory.findIndex((s) => s === null);
+      if (slot < 0) {
+        this.dm(lp, "Inventory full.");
+        return;
+      }
+      if (bestKind === "scrap") {
+        const s = sceneInst.scrap[bestIdx]!;
+        s.carriedBy = p.id;
+        // Move scrap entity into inventory by removing from scene list
+        sceneInst.scrap.splice(bestIdx, 1);
+        p.inventory[slot] = { id: s.id, itemId: s.itemId, pos: { x: 0, y: 0 }, carriedBy: p.id };
+        // We lose the per-scrap value when stowed; remember it via a side map.
+        scrapValueById.set(s.id, s.value);
+      } else {
+        const it = sceneInst.items[bestIdx]!;
+        sceneInst.items.splice(bestIdx, 1);
+        it.carriedBy = p.id;
+        p.inventory[slot] = { id: it.id, itemId: it.itemId, pos: { x: 0, y: 0 }, carriedBy: p.id };
       }
     }
   }
@@ -375,66 +458,57 @@ export class Lobby {
     const slot = p.selectedSlot;
     const it = p.inventory[slot];
     if (!it) return;
+    const sceneInst = this.sceneFor(p.scene);
+    if (!sceneInst) return;
     p.inventory[slot] = null;
-    if (this.facility && p.scene === Scene.Facility) {
-      // Keep entity on the floor at player's pos
-      const isScrap = it.itemId.startsWith("scrap_");
-      if (isScrap) {
-        const existing = this.facility.scrap.find((s) => s.id === it.id);
-        if (existing) {
-          existing.pos = { x: p.pos.x, y: p.pos.y };
-          existing.carriedBy = null;
-        }
-      } else {
-        const existing = this.facility.items.find((s) => s.id === it.id);
-        if (existing) {
-          existing.pos = { x: p.pos.x, y: p.pos.y };
-          existing.carriedBy = null;
-        } else {
-          this.facility.items.push({ id: it.id, itemId: it.itemId, pos: { x: p.pos.x, y: p.pos.y }, carriedBy: null });
-        }
-      }
-    }
-    // Items dropped on the ship are simply removed for v0.1 (no overworld pickup yet)
-  }
-
-  private depositPlayerScrap(lp: LobbyPlayer): void {
-    const p = lp.state;
-    if (!this.facility) return;
-    let deposited = 0;
-    for (let i = 0; i < p.inventory.length; i++) {
-      const it = p.inventory[i];
-      if (!it) continue;
-      if (it.itemId.startsWith("scrap_")) {
-        const s = this.facility.scrap.find((x) => x.id === it.id);
-        const value = s?.value ?? ITEMS[it.itemId]?.baseValue ?? 0;
-        deposited += value;
-        if (s) s.carriedBy = null; // remove from world
-        // Remove the scrap entity entirely (it's "stowed in ship")
-        this.facility.scrap = this.facility.scrap.filter((x) => x.id !== it.id);
-        p.inventory[i] = null;
-      }
-    }
-    if (deposited > 0) {
-      this.scrapSold += deposited;
-      this.systemMessage(`${p.name} stowed ${deposited} credits worth of scrap.`);
+    const isScrap = it.itemId.startsWith("scrap_");
+    if (isScrap) {
+      const value = scrapValueById.get(it.id) ?? ITEMS[it.itemId]?.baseValue ?? 0;
+      sceneInst.scrap.push({
+        id: it.id,
+        itemId: it.itemId,
+        pos: { x: p.pos.x, y: p.pos.y },
+        value,
+        carriedBy: null,
+      });
+    } else {
+      sceneInst.items.push({
+        id: it.id,
+        itemId: it.itemId,
+        pos: { x: p.pos.x, y: p.pos.y },
+        carriedBy: null,
+      });
     }
   }
 
+  /** Sells every piece of scrap currently on the ship floor + held by anyone in the company building. */
   private sellAllScrap(): void {
-    if (this.scrapSold <= 0) {
-      this.systemMessage("Nothing to sell.");
+    let total = 0;
+    // Ship-floor scrap is "stowed" cargo
+    for (const s of this.shipState.scrap) total += s.value;
+    this.shipState.scrap = [];
+    // Plus held scrap by anyone currently in the company building
+    for (const lp of this.players.values()) {
+      if (lp.state.scene !== Scene.Company) continue;
+      for (let i = 0; i < lp.state.inventory.length; i++) {
+        const it = lp.state.inventory[i];
+        if (it && it.itemId.startsWith("scrap_")) {
+          total += scrapValueById.get(it.id) ?? ITEMS[it.itemId]?.baseValue ?? 0;
+          lp.state.inventory[i] = null;
+        }
+      }
+    }
+    if (total <= 0) {
+      this.systemMessage("Company desk: nothing to sell. Drop scrap inside the ship first.");
       return;
     }
-    const sold = this.scrapSold;
-    this.credits += sold;
-    this.scrapSold = 0;
-    this.systemMessage(`Sold ${sold} credits of scrap to The Company.`);
+    this.credits += total;
+    this.systemMessage(`Sold ${total} credits of scrap. Crew balance: ${this.credits}.`);
   }
 
   private handleBuy(lp: LobbyPlayer, itemId: ItemId, qty: number): void {
     if (lp.state.scene !== Scene.Ship) {
-      this.dm(lp, "Use the terminal in the ship.");
+      this.dm(lp, "Use the console inside the ship.");
       return;
     }
     const def = ITEMS[itemId];
@@ -454,7 +528,7 @@ export class Lobby {
       lp.state.inventory[slot] = {
         id: newEntityId(),
         itemId,
-        pos: { x: lp.state.pos.x, y: lp.state.pos.y },
+        pos: { x: 0, y: 0 },
         carriedBy: lp.state.id,
       };
       bought++;
@@ -468,109 +542,102 @@ export class Lobby {
   }
 
   // ──────────────── Day cycle ────────────────
-  private startLanding(): void {
-    const seed = hashSeed(`${this.code}:${this.moonId}:${this.dayNumber}`);
-    this.facility = generateFacility(this.moonId, seed);
-    const moon = MOONS[this.moonId];
-    // Spawn all players on the exterior landing pad. They walk to the bunker entrance
-    // and on through to the procgen interior themselves.
+  private startLanding(toMoonId: string): void {
+    const moon = MOONS[toMoonId];
+    if (!moon) return;
+    this.moonId = toMoonId;
+    // Rebuild the surface for the new moon
+    this.surfaceScene = buildSurface(toMoonId);
+    this.surfaceState = { grid: this.surfaceScene.grid, scrap: [], items: [], monsters: [] };
+    // (Re)generate facility interior if applicable, with a fresh random seed
+    if (moon.hasFacility) {
+      this.interiorScene = generateFacility(toMoonId);
+      this.interiorState = {
+        grid: this.interiorScene.scene,
+        scrap: this.interiorScene.scrap,
+        items: [],
+        monsters: this.interiorScene.monsters,
+      };
+    } else {
+      this.interiorScene = null;
+      this.interiorState = null;
+    }
+
+    // Pull every player into the ship for the cutscene; they emerge by walking
+    // out the ship door once the cutscene ends.
     for (const lp of this.players.values()) {
-      lp.state.scene = Scene.Facility;
-      // Spread players slightly across the 5x5 pad so they don't pile up
-      const pad = this.facility.shipExit;
-      const idx = [...this.players.values()].indexOf(lp);
-      const offsets = [
-        { x: 0, y: 0 },
-        { x: 1.0, y: 0 },
-        { x: -1.0, y: 0 },
-        { x: 0, y: 1.0 },
-      ];
-      const off = offsets[idx % offsets.length]!;
-      lp.state.pos = { x: pad.x + off.x, y: pad.y + off.y };
+      lp.state.scene = Scene.Ship;
+      lp.state.pos = { x: this.shipScene.innerSpawn.x, y: this.shipScene.innerSpawn.y };
       lp.state.hp = PLAYER_MAX_HEALTH;
       lp.state.alive = true;
-      lp.state.facing = -Math.PI / 2; // face north toward the bunker
+      this.sendSceneToPlayer(lp);
     }
     this.phase = "landing";
     this.landingEndsAtTick = this.tick_n + Math.ceil(LANDING_CUTSCENE_MS / TICK_MS);
-    // Send facility scene to clients (they'll show the cutscene overlay)
-    this.broadcast({
-      t: "scene_facility",
-      facility: {
-        moonId: this.moonId,
-        moonName: moon?.name,
-        seed,
-        scene: this.facility.scene,
-        scrap: this.facility.scrap,
-        items: this.facility.items,
-        monsters: this.facility.monsters,
-        shipExit: this.facility.shipExit,
-        entrance: this.facility.entrance,
-      },
-    });
-    this.systemMessage(`Descending to ${moon?.name ?? this.moonId}. Day ${this.dayNumber}.`);
+    // Tell clients to play the descent cutscene
+    this.broadcast({ t: "cutscene_begin", moonId: toMoonId, moonName: moon.name, durationMs: LANDING_CUTSCENE_MS });
+    this.systemMessage(`Descending to ${moon.name}.`);
   }
 
-  private returnToOrbit(): void {
-    // Players still in facility: deposit scrap + return
+  private returnToShip(): void {
     for (const lp of this.players.values()) {
-      if (lp.state.scene !== Scene.Facility) continue;
-      this.depositPlayerScrap(lp);
       lp.state.scene = Scene.Ship;
-      lp.state.pos = { x: this.shipSpawn.x, y: this.shipSpawn.y };
+      lp.state.pos = { x: this.shipScene.innerSpawn.x, y: this.shipScene.innerSpawn.y };
+      this.sendSceneToPlayer(lp);
     }
-    this.endDay({ leftBehind: 0 });
   }
 
   private endDayHostile(): void {
     let leftBehind = 0;
     for (const lp of this.players.values()) {
-      if (lp.state.scene === Scene.Facility) {
+      if (lp.state.scene === Scene.Interior) {
         if (lp.state.alive) {
           this.systemMessage(`${lp.state.name} was left behind.`);
           lp.state.alive = false;
         }
-        lp.state.scene = Scene.Ship;
-        lp.state.pos = { x: this.shipSpawn.x, y: this.shipSpawn.y };
         leftBehind++;
       }
+    }
+    // Force everyone into the ship (cutscene-style — no hard transition needed)
+    for (const lp of this.players.values()) {
+      lp.state.scene = Scene.Ship;
+      lp.state.pos = { x: this.shipScene.innerSpawn.x, y: this.shipScene.innerSpawn.y };
+      this.sendSceneToPlayer(lp);
     }
     this.endDay({ leftBehind });
   }
 
   private endDay({ leftBehind: _leftBehind }: { leftBehind: number }): void {
-    this.facility = null;
-    this.phase = "in_ship";
+    this.interiorScene = null;
+    this.interiorState = null;
+    this.phase = "in_facility";
     this.daysRemaining--;
     this.broadcast({
       t: "day_end",
       survivors: [...this.players.values()].filter((p) => p.state.alive).map((p) => p.state.id),
-      scrapTotal: this.scrapSold,
+      scrapTotal: this.shipState.scrap.length,
     });
-    this.broadcast({ t: "scene_ship", ship: { scene: this.ship } });
 
-    // Revive everyone for next day (v0.1 simplification: only quota loss is game-over)
     for (const lp of this.players.values()) {
       lp.state.alive = true;
       lp.state.hp = PLAYER_MAX_HEALTH;
     }
 
     if (this.daysRemaining <= 0) {
-      // Quota check
-      if (this.credits + this.scrapSold >= this.quota) {
-        // Met quota — reset
+      // Quota check at end of cycle
+      const stowedValue = this.shipState.scrap.reduce((a, s) => a + s.value, 0);
+      if (this.credits + stowedValue >= this.quota) {
         this.systemMessage(`Quota met! New quota: ${Math.ceil(this.quota * QUOTA_INCREMENT)}.`);
         this.quota = Math.ceil(this.quota * QUOTA_INCREMENT);
         this.daysRemaining = DAYS_PER_QUOTA_CYCLE;
       } else {
-        // Game over
         this.phase = "game_over";
         this.broadcast({
           t: "game_over",
           reason: `You failed to meet quota of ${this.quota}.`,
           finalQuotaCycle: Math.floor(this.dayNumber / DAYS_PER_QUOTA_CYCLE),
         });
-        this.systemMessage(`GAME OVER — quota not met.`);
+        this.systemMessage("GAME OVER — quota not met.");
         this.resetForNewGame();
         return;
       }
@@ -585,11 +652,20 @@ export class Lobby {
       this.daysRemaining = DAYS_PER_QUOTA_CYCLE;
       this.quota = STARTING_QUOTA;
       this.credits = STARTING_CREDITS;
-      this.scrapSold = 0;
+      this.shipState.scrap = [];
+      this.shipState.items = [];
       this.phase = "in_ship";
       for (const lp of this.players.values()) {
         lp.state.inventory = new Array(PLAYER_INVENTORY_SLOTS).fill(null);
-        lp.state.pos = { x: this.shipSpawn.x, y: this.shipSpawn.y };
+        lp.state.inventory[0] = {
+          id: newEntityId(),
+          itemId: "flashlight",
+          pos: { x: 0, y: 0 },
+          carriedBy: lp.state.id,
+        };
+        lp.state.pos = { x: this.shipScene.innerSpawn.x, y: this.shipScene.innerSpawn.y };
+        lp.state.scene = Scene.Ship;
+        this.sendSceneToPlayer(lp);
       }
       this.systemMessage("New contract begun.");
     }, 4000);
@@ -602,7 +678,7 @@ export class Lobby {
     const sender = lp.state;
     if (channel === "ship") {
       if (sender.scene !== Scene.Ship) {
-        this.dm(lp, "You must be on the ship to use ship channel.");
+        this.dm(lp, "You must be inside the ship to use ship channel.");
         return;
       }
       for (const other of this.players.values()) {
@@ -612,14 +688,13 @@ export class Lobby {
       }
       return;
     }
-    // proximity
+    // Proximity — same scene, within radius, with line-of-sight
     for (const other of this.players.values()) {
       if (other.state.scene !== sender.scene) continue;
       const d = Math.hypot(other.state.pos.x - sender.pos.x, other.state.pos.y - sender.pos.y);
       if (d <= PROXIMITY_TEXT_RADIUS) {
-        // simple wall block: if direct sight is blocked, drop the message
-        const grid = sender.scene === Scene.Ship ? this.ship : this.facility?.scene;
-        if (!grid || lineOfSight(grid, sender.pos, other.state.pos)) {
+        const inst = this.sceneFor(sender.scene);
+        if (!inst || lineOfSight(inst.grid, sender.pos, other.state.pos)) {
           other.ctx.send({ t: "chat", from: sender.id, fromName: sender.name, text, channel: "proximity" });
         }
       }
@@ -636,7 +711,6 @@ export class Lobby {
   private allReady(): boolean {
     return this.players.size > 0 && [...this.players.values()].every((lp) => lp.ready);
   }
-
   private lobbyRoster() {
     return [...this.players.values()].map((p) => ({
       id: p.state.id,
@@ -645,32 +719,32 @@ export class Lobby {
       ready: p.ready,
     }));
   }
-
   private broadcastLobbyUpdate(): void {
     this.broadcast({ t: "lobby_update", players: this.lobbyRoster(), phase: this.phase });
   }
 
   private broadcastSnapshot(): void {
-    const playersArr: PlayerState[] = [...this.players.values()].map((p) => p.state);
-    const monsters: Monster[] = this.facility?.monsters ?? [];
-    const scrap: ScrapInstance[] = this.facility?.scrap ?? [];
-    const items: ItemInstance[] = this.facility?.items ?? [];
-    const snap: GameSnapshot = {
-      tick: this.tick_n,
-      phase: this.phase,
-      dayNumber: this.dayNumber,
-      daysRemaining: this.daysRemaining,
-      quota: this.quota,
-      scrapSold: this.scrapSold,
-      credits: this.credits,
-      timeRemaining: this.timeRemaining,
-      players: playersArr,
-      monsters,
-      scrap,
-      items,
-    };
-    for (const p of this.players.values()) {
-      p.ctx.send({ t: "snapshot", snap, ackSeq: p.lastInputSeq });
+    // Each player gets a personalized snapshot containing only entities in their scene.
+    for (const lp of this.players.values()) {
+      const myScene = lp.state.scene;
+      const inst = this.sceneFor(myScene);
+      const playersInScene = [...this.players.values()].map((p) => p.state).filter((p) => p.scene === myScene);
+      const stowed = this.shipState.scrap.reduce((a, s) => a + s.value, 0);
+      const snap: GameSnapshot = {
+        tick: this.tick_n,
+        phase: this.phase,
+        dayNumber: this.dayNumber,
+        daysRemaining: this.daysRemaining,
+        quota: this.quota,
+        scrapSold: stowed,
+        credits: this.credits,
+        timeRemaining: this.timeRemaining,
+        players: playersInScene,
+        monsters: inst?.monsters ?? [],
+        scrap: inst?.scrap ?? [],
+        items: inst?.items ?? [],
+      };
+      lp.ctx.send({ t: "snapshot", snap, ackSeq: lp.lastInputSeq });
     }
   }
 
@@ -680,17 +754,19 @@ export class Lobby {
       p.ctx.send(msg);
     }
   }
-
   private systemMessage(text: string): void {
     for (const p of this.players.values()) {
       p.ctx.send({ t: "chat", from: "system", fromName: "SYSTEM", text, channel: "system" });
     }
   }
-
   private dm(lp: LobbyPlayer, text: string): void {
     lp.ctx.send({ t: "chat", from: "system", fromName: "SYSTEM", text, channel: "system" });
   }
 }
+
+// Side map: scrap value gets attached to the carried inventory item by id so
+// we don't lose its sell price when it's stowed in the player's inventory.
+const scrapValueById = new Map<number, number>();
 
 function clampVec(v: Vec2 | null | undefined): Vec2 {
   if (!v) return { x: 0, y: 0 };
@@ -705,16 +781,16 @@ function clampSlot(n: unknown): number {
   const x = Math.floor(Number(n) || 0);
   return Math.max(0, Math.min(PLAYER_INVENTORY_SLOTS - 1, x));
 }
-
 function hasItem(p: PlayerState, itemId: ItemId): boolean {
   return p.inventory.some((i) => i?.itemId === itemId);
 }
-
-function hashSeed(s: string): number {
-  let h = 2166136261 >>> 0;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 16777619);
+function tileAdjacent(g: TileGrid, pos: Vec2, target: TileType): boolean {
+  const cx = Math.floor(pos.x);
+  const cy = Math.floor(pos.y);
+  for (let dy = -1; dy <= 1; dy++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      if (tileAt(g, cx + dx, cy + dy) === target) return true;
+    }
   }
-  return h >>> 0;
+  return false;
 }

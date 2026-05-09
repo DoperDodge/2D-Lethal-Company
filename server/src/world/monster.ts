@@ -12,7 +12,7 @@ export function stepMonster(m: Monster, dt: number, grid: TileGrid, players: Pla
   let target: PlayerState | null = null;
   let bestDist = Infinity;
   for (const p of players) {
-    if (!p.alive || p.scene !== Scene.Facility) continue;
+    if (!p.alive || p.scene !== Scene.Interior) continue;
     const d = Math.hypot(p.pos.x - m.pos.x, p.pos.y - m.pos.y);
     if (d < SIGHT_RANGE && d < bestDist) {
       if (lineOfSight(grid, m.pos, p.pos)) {
