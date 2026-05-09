@@ -16,7 +16,7 @@ export function Terminal({
   onLaunch: () => void;
 }) {
   const [tab, setTab] = useState<"store" | "moons">("store");
-  const credits = state.snap?.credits ?? 0;
+  const credits = state.displaySnap?.credits ?? 0;
   return (
     <div className="terminal">
       <h2>SHIP TERMINAL</h2>
@@ -78,7 +78,7 @@ export function Terminal({
       </div>
       <div className="footer">
         <span>Crew Credits: {credits}</span>
-        <span style={{ color: "var(--fg-dim)" }}>Stowed: {state.snap?.scrapSold ?? 0}</span>
+        <span style={{ color: "var(--fg-dim)" }}>Stowed: {state.displaySnap?.scrapSold ?? 0}</span>
       </div>
     </div>
   );

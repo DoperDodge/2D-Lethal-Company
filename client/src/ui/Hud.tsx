@@ -4,7 +4,7 @@ import { getMyPlayer } from "../game/state.js";
 
 export function Hud({ state }: { state: ClientGameState }) {
   const me = getMyPlayer(state);
-  const snap = state.snap;
+  const snap = state.displaySnap;
   if (!snap) return null;
 
   return (
