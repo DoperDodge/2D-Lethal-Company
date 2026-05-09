@@ -20,12 +20,13 @@ export function isBlocking(t: TileType): boolean {
     t === TileType.ShipBunk ||
     t === TileType.ShipLocker ||
     t === TileType.ShipChargeStation ||
-    t === TileType.ShipTerminal
+    t === TileType.ShipTerminal ||
+    t === TileType.ShipConsole ||
+    t === TileType.CompanyDesk
   );
 }
 
 export function isWalkable(g: TileGrid, fx: number, fy: number): boolean {
-  // Treat float coords as a small AABB and check 4 corners
   const r = 0.3;
   const corners: Vec2[] = [
     { x: fx - r, y: fy - r },
@@ -40,7 +41,7 @@ export function isWalkable(g: TileGrid, fx: number, fy: number): boolean {
   return true;
 }
 
-// Bresenham-style LOS check between two world (float) positions.
+// Bresenham LOS check between two world (float) positions.
 export function lineOfSight(g: TileGrid, a: Vec2, b: Vec2): boolean {
   let x0 = Math.floor(a.x);
   let y0 = Math.floor(a.y);

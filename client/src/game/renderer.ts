@@ -238,8 +238,8 @@ function drawTile(ctx: CanvasRenderingContext2D, t: number, sx: number, sy: numb
       ctx.fillStyle = "rgba(255,255,255,0.06)";
       ctx.fillRect(sx, sy, px + 1, 2 * dpi);
       return;
-    case TileType.ShipExit: {
-      // Cockpit launch console — yellow+amber lit panel
+    case TileType.ShipConsole: {
+      // Interactive launch/buy terminal — amber-glow lit panel
       ctx.fillStyle = "#3a3a48";
       ctx.fillRect(sx, sy, px + 1, px + 1);
       ctx.fillStyle = "#ffd14a";
@@ -249,6 +249,35 @@ function drawTile(ctx: CanvasRenderingContext2D, t: number, sx: number, sy: numb
       ctx.fillRect(sx + 6 * dpi, sy + 10 * dpi, px - 12 * dpi, 2 * dpi);
       return;
     }
+    case TileType.ShipDoor:
+      // Sealed pressure hatch — leads outside (or back inside) the ship
+      ctx.fillStyle = "#1a1c28";
+      ctx.fillRect(sx, sy, px + 1, px + 1);
+      ctx.fillStyle = "#3a3a48";
+      ctx.fillRect(sx + 2 * dpi, sy + 2 * dpi, px - 4 * dpi, px - 4 * dpi);
+      ctx.fillStyle = "#5fc97d";
+      ctx.fillRect(sx + 4 * dpi, sy + px / 2 - dpi, px - 8 * dpi, 2 * dpi);
+      ctx.strokeStyle = "rgba(95, 201, 125, 0.7)";
+      ctx.lineWidth = dpi;
+      ctx.strokeRect(sx + 3 * dpi, sy + 3 * dpi, px - 6 * dpi, px - 6 * dpi);
+      return;
+    case TileType.CompanyDoor:
+      // Glass-fronted trading-post door
+      ctx.fillStyle = "#1a1c28";
+      ctx.fillRect(sx, sy, px + 1, px + 1);
+      ctx.fillStyle = "#56b9e0";
+      ctx.fillRect(sx + 3 * dpi, sy + 3 * dpi, px - 6 * dpi, px - 6 * dpi);
+      ctx.fillStyle = "#0a3a4a";
+      ctx.fillRect(sx + px / 2 - dpi, sy + 3 * dpi, 2 * dpi, px - 6 * dpi);
+      return;
+    case TileType.CompanyPlaza:
+      // Polished concrete plaza
+      ctx.fillStyle = "#383848";
+      ctx.fillRect(sx, sy, px + 1, px + 1);
+      ctx.strokeStyle = "rgba(0,0,0,0.18)";
+      ctx.lineWidth = dpi;
+      ctx.strokeRect(sx + 0.5 * dpi, sy + 0.5 * dpi, px - dpi, px - dpi);
+      return;
     case TileType.CompanyDesk:
       ctx.fillStyle = "#3a2a1a";
       ctx.fillRect(sx, sy, px + 1, px + 1);

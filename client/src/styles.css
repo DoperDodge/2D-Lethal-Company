@@ -439,3 +439,57 @@ input:focus, select:focus {
   margin-top: 16px;
   opacity: 0.7;
 }
+
+/* ──────────── Scan overlay ──────────── */
+.scan-overlay {
+  position: absolute;
+  top: 50%;
+  right: 24px;
+  transform: translateY(-50%);
+  width: 240px;
+  background: rgba(10, 14, 20, 0.88);
+  border: 1px solid var(--accent-dim);
+  padding: 10px 12px;
+  font-size: 12px;
+  pointer-events: none;
+  z-index: 50;
+  animation: scan-in 0.18s ease-out;
+}
+@keyframes scan-in {
+  from {
+    opacity: 0;
+    transform: translateY(-50%) translateX(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(-50%) translateX(0);
+  }
+}
+.scan-header {
+  color: var(--accent);
+  letter-spacing: 4px;
+  font-weight: 700;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 6px;
+  margin-bottom: 6px;
+}
+.scan-total {
+  color: var(--good);
+  letter-spacing: 1px;
+  font-size: 11px;
+}
+.scan-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 2px 0;
+}
+.scan-name {
+  color: var(--fg);
+}
+.scan-value {
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}

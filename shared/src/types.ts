@@ -13,27 +13,39 @@ export const TileType = {
   Vent: 4,
   ShipFloor: 5,
   ShipWall: 6,
-  ShipExit: 7,
+  // Ship console: press E to open the buy/launch terminal.
+  ShipConsole: 7,
+  // Sell desk inside the company building (only on the Atrium sell moon).
   CompanyDesk: 8,
-  // Exterior surface (walkable dusty ground)
+  // Outdoor moon surface (walkable dusty/concrete ground).
   Exterior: 9,
-  // Impassable rocky terrain outside
+  // Impassable rocky terrain outside.
   ExteriorRock: 10,
-  // Painted hazard pad where the dropship lands (walkable)
+  // Painted hazard pad where the ship is parked on a moon.
   LandingPad: 11,
-  // Main facility entrance door (walkable, marks transition exterior -> interior)
+  // Door between the moon surface and the procgen facility interior.
   FacilityEntrance: 12,
-  // Ship interior decor (non-blocking visual)
+  // Decor inside the ship.
   ShipTerminal: 13,
   ShipChargeStation: 14,
   ShipBunk: 15,
   ShipLocker: 16,
+  // Door between the moon surface and the inside of the ship.
+  ShipDoor: 17,
+  // Door between the moon surface and the company building (Atrium only).
+  CompanyDoor: 18,
+  // Walkable concrete plaza outside the company building.
+  CompanyPlaza: 19,
 } as const;
 export type TileType = (typeof TileType)[keyof typeof TileType];
 
+// Scene id: "ship" | "surface" | "interior" | "company".
+// Players' positions are relative to the grid of whichever scene they're in.
 export const Scene = {
   Ship: "ship",
-  Facility: "facility",
+  Surface: "surface",
+  Interior: "interior",
+  Company: "company",
 } as const;
 export type Scene = (typeof Scene)[keyof typeof Scene];
 
@@ -96,6 +108,20 @@ export type ShipState = {
   scene: TileGrid;
 };
 
+// One scene's static layout + initial entities.
+// Sent on scene-change. Snapshots only carry per-tick state for the player's current scene.
+export type SceneState = {
+  scene: Scene;
+  moonId?: string;
+  moonName?: string;
+  seed?: number;
+  grid: TileGrid;
+  scrap: ScrapInstance[];
+  items: ItemInstance[];
+  monsters: Monster[];
+};
+
+// Backwards-compat shape used by the protocol's scene_facility messages.
 export type FacilityState = {
   moonId: string;
   moonName?: string;
@@ -104,9 +130,7 @@ export type FacilityState = {
   scrap: ScrapInstance[];
   items: ItemInstance[];
   monsters: Monster[];
-  // Where the dropship pad is on the facility map (player spawn for landings)
   shipExit: Vec2;
-  // Main entrance to the bunker — visual marker used by the cutscene's "find the door" prompt
   entrance?: Vec2;
 };
 
