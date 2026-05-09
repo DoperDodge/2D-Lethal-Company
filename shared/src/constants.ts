@@ -5,10 +5,21 @@ export const SNAPSHOT_RATE = 20; // Hz outbound to clients
 
 // World grid
 export const TILE_SIZE = 24; // pixels per tile (client render scale)
-export const FACILITY_W = 64;
-export const FACILITY_H = 64;
-export const SHIP_W = 16;
-export const SHIP_H = 12;
+export const FACILITY_W = 80;
+export const FACILITY_H = 80;
+// Inset bunker footprint inside the facility map
+export const BUNKER_INSET = 14;
+export const BUNKER_W = FACILITY_W - BUNKER_INSET * 2;
+export const BUNKER_H = FACILITY_H - BUNKER_INSET * 2;
+export const SHIP_W = 22;
+export const SHIP_H = 16;
+
+// Render / loop
+export const RENDER_FPS_CAP = 60;
+export const SNAPSHOT_RENDER_DELAY_MS = 90; // interpolation delay (~2 ticks)
+
+// Cutscene
+export const LANDING_CUTSCENE_MS = 3500;
 
 // Player
 export const PLAYER_RADIUS = 0.35; // tiles

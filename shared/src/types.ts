@@ -15,6 +15,19 @@ export const TileType = {
   ShipWall: 6,
   ShipExit: 7,
   CompanyDesk: 8,
+  // Exterior surface (walkable dusty ground)
+  Exterior: 9,
+  // Impassable rocky terrain outside
+  ExteriorRock: 10,
+  // Painted hazard pad where the dropship lands (walkable)
+  LandingPad: 11,
+  // Main facility entrance door (walkable, marks transition exterior -> interior)
+  FacilityEntrance: 12,
+  // Ship interior decor (non-blocking visual)
+  ShipTerminal: 13,
+  ShipChargeStation: 14,
+  ShipBunk: 15,
+  ShipLocker: 16,
 } as const;
 export type TileType = (typeof TileType)[keyof typeof TileType];
 
@@ -85,12 +98,16 @@ export type ShipState = {
 
 export type FacilityState = {
   moonId: string;
+  moonName?: string;
   seed: number;
   scene: TileGrid;
   scrap: ScrapInstance[];
   items: ItemInstance[];
   monsters: Monster[];
-  shipExit: Vec2; // where landing pod is on the facility map
+  // Where the dropship pad is on the facility map (player spawn for landings)
+  shipExit: Vec2;
+  // Main entrance to the bunker — visual marker used by the cutscene's "find the door" prompt
+  entrance?: Vec2;
 };
 
 export type GameSnapshot = {

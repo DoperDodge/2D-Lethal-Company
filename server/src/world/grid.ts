@@ -12,7 +12,16 @@ export function setTile(g: TileGrid, x: number, y: number, t: TileType): void {
 }
 
 export function isBlocking(t: TileType): boolean {
-  return t === TileType.Wall || t === TileType.ShipWall || t === TileType.Empty;
+  return (
+    t === TileType.Wall ||
+    t === TileType.ShipWall ||
+    t === TileType.Empty ||
+    t === TileType.ExteriorRock ||
+    t === TileType.ShipBunk ||
+    t === TileType.ShipLocker ||
+    t === TileType.ShipChargeStation ||
+    t === TileType.ShipTerminal
+  );
 }
 
 export function isWalkable(g: TileGrid, fx: number, fy: number): boolean {

@@ -3,6 +3,7 @@ import {
   DAY_LENGTH_SECONDS,
   DEFAULT_MOON_ID,
   DOOR_CLOSE_WARNING_SEC,
+  LANDING_CUTSCENE_MS,
   PLAYER_INVENTORY_SLOTS,
   PLAYER_MAX_HEALTH,
   PLAYER_SPEED,
@@ -78,6 +79,8 @@ export class Lobby {
   private credits = STARTING_CREDITS;
   private timeRemaining = DAY_LENGTH_SECONDS;
   private warnedDoorClose = false;
+  // Tick at which the landing cutscene ends and free movement begins.
+  private landingEndsAtTick = 0;
 
   constructor(code: LobbyCode, maxPlayers: number) {
     this.code = code;
@@ -201,6 +204,12 @@ export class Lobby {
     this.tick_n++;
     const dt = TICK_MS / 1000;
 
+    if (this.phase === "landing" && this.tick_n >= this.landingEndsAtTick) {
+      this.phase = "in_facility";
+      this.timeRemaining = DAY_LENGTH_SECONDS;
+      this.warnedDoorClose = false;
+    }
+
     if (this.phase === "in_facility") {
       this.timeRemaining = Math.max(0, this.timeRemaining - dt);
       if (this.timeRemaining < DOOR_CLOSE_WARNING_SEC && !this.warnedDoorClose) {
@@ -249,6 +258,13 @@ export class Lobby {
     if (!p.alive) {
       p.vel.x = 0;
       p.vel.y = 0;
+      return;
+    }
+    // During landing cutscene, hold the player still on the landing pad.
+    if (this.phase === "landing") {
+      p.vel.x = 0;
+      p.vel.y = 0;
+      if (inp) lp.lastInputSeq = inp.seq;
       return;
     }
     let mvx = 0,
@@ -453,33 +469,46 @@ export class Lobby {
 
   // ──────────────── Day cycle ────────────────
   private startLanding(): void {
-    this.phase = "landing";
     const seed = hashSeed(`${this.code}:${this.moonId}:${this.dayNumber}`);
     this.facility = generateFacility(this.moonId, seed);
-    this.timeRemaining = DAY_LENGTH_SECONDS;
-    this.warnedDoorClose = false;
-    // Move all players into the facility at the ship-exit pad
+    const moon = MOONS[this.moonId];
+    // Spawn all players on the exterior landing pad. They walk to the bunker entrance
+    // and on through to the procgen interior themselves.
     for (const lp of this.players.values()) {
       lp.state.scene = Scene.Facility;
-      lp.state.pos = { x: this.facility.shipExit.x, y: this.facility.shipExit.y };
+      // Spread players slightly across the 5x5 pad so they don't pile up
+      const pad = this.facility.shipExit;
+      const idx = [...this.players.values()].indexOf(lp);
+      const offsets = [
+        { x: 0, y: 0 },
+        { x: 1.0, y: 0 },
+        { x: -1.0, y: 0 },
+        { x: 0, y: 1.0 },
+      ];
+      const off = offsets[idx % offsets.length]!;
+      lp.state.pos = { x: pad.x + off.x, y: pad.y + off.y };
       lp.state.hp = PLAYER_MAX_HEALTH;
       lp.state.alive = true;
+      lp.state.facing = -Math.PI / 2; // face north toward the bunker
     }
-    this.phase = "in_facility";
-    // Send facility scene
+    this.phase = "landing";
+    this.landingEndsAtTick = this.tick_n + Math.ceil(LANDING_CUTSCENE_MS / TICK_MS);
+    // Send facility scene to clients (they'll show the cutscene overlay)
     this.broadcast({
       t: "scene_facility",
       facility: {
         moonId: this.moonId,
+        moonName: moon?.name,
         seed,
         scene: this.facility.scene,
         scrap: this.facility.scrap,
         items: this.facility.items,
         monsters: this.facility.monsters,
         shipExit: this.facility.shipExit,
+        entrance: this.facility.entrance,
       },
     });
-    this.systemMessage(`Landed on ${MOONS[this.moonId]?.name ?? this.moonId}. Day ${this.dayNumber}.`);
+    this.systemMessage(`Descending to ${moon?.name ?? this.moonId}. Day ${this.dayNumber}.`);
   }
 
   private returnToOrbit(): void {

@@ -1,13 +1,19 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Socket } from "../net/socket.js";
-import { activeGrid, getMyPlayer, type ClientGameState } from "../game/state.js";
+import {
+  activeGrid,
+  buildDisplaySnap,
+  getMyPlayer,
+  type ClientGameState,
+} from "../game/state.js";
 import { Renderer } from "../game/renderer.js";
 import { InputController } from "../game/input.js";
 import { VoiceMesh } from "../net/voice.js";
-import { Scene, TileType } from "@quota/shared";
+import { RENDER_FPS_CAP, Scene, SNAPSHOT_RENDER_DELAY_MS, TileType } from "@quota/shared";
 import { Hud } from "./Hud.js";
 import { Chat } from "./Chat.js";
 import { Terminal } from "./Terminal.js";
+import { LandingCutscene } from "./LandingCutscene.js";
 
 export function GameView({
   socket,
@@ -25,6 +31,8 @@ export function GameView({
   const [chatOpen, setChatOpen] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(false);
   const seqRef = useRef(0);
+  // Track flashlight state locally (toggled by client, sent on each input)
+  const flashlightRef = useRef(false);
 
   // Voice mesh: subscribe to signals, keep peers fresh as roster changes
   useEffect(() => {
@@ -37,7 +45,6 @@ export function GameView({
         await v.handleSignal(msg.fromPlayerId, msg.payload);
       }
       if (msg.t === "lobby_update") {
-        // Initiate to peers with id < ours to avoid offer/offer races
         const me = stateRef.current.myId;
         if (!me) return;
         for (const p of msg.players) {
@@ -70,105 +77,83 @@ export function GameView({
     };
   }, [chatOpen]);
 
-  // Game loop
+  // Game loop with 60fps cap, snapshot interpolation, and reliable net-edge transmit
   useEffect(() => {
     let raf = 0;
+    const frameInterval = 1000 / RENDER_FPS_CAP;
+    let lastFrame = performance.now();
     let lastInputSentAt = 0;
-    let last = performance.now();
     const tick = (now: number) => {
-      const dt = (now - last) / 1000;
-      last = now;
+      raf = requestAnimationFrame(tick);
+      const elapsed = now - lastFrame;
+      // Hard 60fps cap — if we haven't waited the frame interval yet, skip
+      if (elapsed < frameInterval - 0.5) return;
+      lastFrame = now - (elapsed % frameInterval);
+
       const c = canvasRef.current!;
       const renderer = rendererRef.current!;
       const input = inputRef.current;
       const state = stateRef.current;
 
-      // Edges: handle UI / interactions
-      const edges = input.consumeEdges();
-      if (edges.chatToggle) {
+      // 1. Drain UI edges every frame (toggles, holds)
+      const ui = input.consumeUiEdges();
+      if (ui.chatToggle) {
         setChatOpen((v) => !v);
         input.forceRefocus();
       }
-      if (edges.terminalToggle) {
+      if (ui.terminalToggle) {
         setTerminalOpen((v) => !v);
       }
-      if (edges.flashlightToggle) {
-        const me = getMyPlayer(state);
-        if (me) me.flashlightOn = !me.flashlightOn;
+      if (ui.flashlightToggle) {
+        flashlightRef.current = !flashlightRef.current;
       }
-      if (edges.voicePressed) voiceRef.current?.setActive(true);
-      if (edges.voiceReleased) voiceRef.current?.setActive(false);
+      if (ui.voicePressed) voiceRef.current?.setActive(true);
+      if (ui.voiceReleased) voiceRef.current?.setActive(false);
 
-      // Compute facing from mouse for sending to server
+      // 2. Build display snapshot via interpolation
+      const renderTime = Date.now() - SNAPSHOT_RENDER_DELAY_MS;
+      state.displaySnap = buildDisplaySnap(state, renderTime);
+
+      // 3. Render
       const facing = renderer.computeFacing(c, { x: input.state.mouseX, y: input.state.mouseY });
-      const me = getMyPlayer(state);
-      const flashlightOn = !!me?.flashlightOn;
+      renderer.draw(state, facing);
 
-      // Send input @ 30Hz
-      if (now - lastInputSentAt > 1000 / 30) {
+      // 4. Send input — drain net edges only at send-time so they're never lost.
+      //    Sending @ ~30Hz is plenty for movement; net edges are accumulated since the last send.
+      if (now - lastInputSentAt >= 1000 / 30) {
         lastInputSentAt = now;
+        const net = input.consumeNetEdges();
         seqRef.current++;
         socket.send({
           t: "input",
           seq: seqRef.current,
           mv: { x: input.state.mvx, y: input.state.mvy },
           facing,
-          flashlight: flashlightOn,
-          interact: edges.interact,
-          drop: edges.drop,
+          flashlight: flashlightRef.current,
+          interact: net.interact,
+          drop: net.drop,
           selectedSlot: input.state.selectedSlot,
         });
       }
 
-      // Local prediction: integrate movement client-side
-      if (me) {
-        const grid = activeGrid(state);
-        if (grid && state.predictedPos) {
-          const speed = 4.0;
-          let mx = input.state.mvx,
-            my = input.state.mvy;
-          const mag = Math.hypot(mx, my);
-          if (mag > 1) {
-            mx /= mag;
-            my /= mag;
-          }
-          const nx = state.predictedPos.x + mx * speed * dt;
-          const ny = state.predictedPos.y + my * speed * dt;
-          if (canStepTo(grid, nx, state.predictedPos.y)) state.predictedPos.x = nx;
-          if (canStepTo(grid, state.predictedPos.x, ny)) state.predictedPos.y = ny;
-          // Soft pull toward server position
-          const sx = me.pos.x;
-          const sy = me.pos.y;
-          state.predictedPos.x += (sx - state.predictedPos.x) * Math.min(1, dt * 4);
-          state.predictedPos.y += (sy - state.predictedPos.y) * Math.min(1, dt * 4);
-        } else if (grid) {
-          state.predictedPos = { x: me.pos.x, y: me.pos.y };
-        }
-      }
-
-      // Render
-      renderer.draw(state, { x: input.state.mouseX, y: input.state.mouseY });
-
-      // Update voice proximity
-      const snap = state.snap;
+      // 5. Update voice proximity from latest snapshot
+      const me = getMyPlayer(state);
       const grid = activeGrid(state);
-      if (snap && voiceRef.current && me) {
-        voiceRef.current.updateProximity(snap, grid, me.pos, me.scene);
+      if (state.displaySnap && voiceRef.current && me) {
+        voiceRef.current.updateProximity(state.displaySnap, grid, me.pos, me.scene);
       }
-
-      raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
   }, [socket, stateRef]);
 
-  // Heartbeat ping for latency
+  // Heartbeat ping for latency tracking
   useEffect(() => {
     const id = window.setInterval(() => socket.send({ t: "ping", ts: Date.now() }), 4000);
     return () => clearInterval(id);
   }, [socket]);
 
-  // Subscribe to chat / scene messages so React re-renders the HUD/chat
+  // React re-render whenever a server message arrives (for HUD/chat)
   useEffect(() => {
     const off = socket.on(() => forceRender((n) => n + 1));
     return off;
@@ -178,7 +163,7 @@ export function GameView({
   const onShip = me?.scene === Scene.Ship;
   const showTerminal = terminalOpen && onShip;
 
-  // Auto-show toast for tile interactions on ship: hint when standing on store/desk
+  // Hint text when standing on a ship interaction tile
   const tileHint = useMemo(() => {
     if (!me || !onShip || !stateRef.current.shipGrid) return null;
     const g = stateRef.current.shipGrid;
@@ -187,6 +172,10 @@ export function GameView({
     if (t === TileType.CompanyDesk) return "Press E to SELL all stowed scrap";
     return null;
   }, [me?.pos.x, me?.pos.y, onShip, stateRef.current.shipGrid]);
+
+  // Cutscene overlay: shown for ~3.5s after a scene_facility message arrives.
+  // Server also pins players in place during this time (phase = "landing").
+  const cutsceneActive = Date.now() < stateRef.current.cutsceneEndsAt;
 
   return (
     <>
@@ -208,41 +197,29 @@ export function GameView({
           onLaunch={() => socket.send({ t: "launch" })}
         />
       )}
-      {tileHint && <div className="toast">{tileHint}</div>}
+      {tileHint && !cutsceneActive && <div className="toast">{tileHint}</div>}
       {stateRef.current.toast && Date.now() < stateRef.current.toastUntil && (
         <div className="toast" style={{ top: 110 }}>
           {stateRef.current.toast}
         </div>
       )}
-      {!me?.alive && stateRef.current.snap && (
+      {!me?.alive && stateRef.current.displaySnap && !cutsceneActive && (
         <div className="kill-screen">
           <h1>YOU DIED</h1>
           <p>Wait for the ship to leave orbit.</p>
         </div>
       )}
+      {cutsceneActive && (
+        <LandingCutscene
+          moonName={stateRef.current.cutsceneMoonName ?? ""}
+          endsAt={stateRef.current.cutsceneEndsAt}
+        />
+      )}
       <div className="help-overlay">
-        <div><b>WASD</b> move · <b>mouse</b> aim · <b>E</b> interact · <b>G</b> drop</div>
-        <div><b>F</b> flashlight · <b>Tab</b> terminal · <b>Enter</b> chat · <b>V</b> voice</div>
-        <div><b>1–4</b> hotbar slot</div>
+        <div><b>WASD</b> move &middot; <b>mouse</b> aim &middot; <b>E</b> interact &middot; <b>G</b> drop</div>
+        <div><b>F</b> flashlight &middot; <b>Tab</b> terminal &middot; <b>Enter</b> chat &middot; <b>V</b> voice</div>
+        <div><b>1&ndash;4</b> hotbar slot</div>
       </div>
     </>
   );
-}
-
-function canStepTo(g: { w: number; h: number; tiles: Uint8Array }, fx: number, fy: number): boolean {
-  const r = 0.3;
-  const corners: Array<[number, number]> = [
-    [fx - r, fy - r],
-    [fx + r, fy - r],
-    [fx - r, fy + r],
-    [fx + r, fy + r],
-  ];
-  for (const [x, y] of corners) {
-    const ix = Math.floor(x);
-    const iy = Math.floor(y);
-    if (ix < 0 || iy < 0 || ix >= g.w || iy >= g.h) return false;
-    const t = g.tiles[iy * g.w + ix];
-    if (t === TileType.Wall || t === TileType.ShipWall || t === TileType.Empty) return false;
-  }
-  return true;
 }

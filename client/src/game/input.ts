@@ -3,13 +3,24 @@ export type InputState = {
   mvy: number;
   mouseX: number;
   mouseY: number;
-  flashlight: boolean;
+  selectedSlot: number;
+  voiceActive: boolean;
+};
+
+// Edges drained every frame for UI (toggling chat, terminal, flashlight, voice)
+type UiEdges = {
+  chatToggle: boolean;
+  terminalToggle: boolean;
+  flashlightToggle: boolean;
+  voicePressed: boolean;
+  voiceReleased: boolean;
+};
+
+// Edges drained only when an input message is sent to the server.
+// This prevents drop/interact events from being eaten on frames where we don't transmit.
+type NetEdges = {
   interact: boolean;
   drop: boolean;
-  selectedSlot: number;
-  chatOpen: boolean;
-  terminalOpen: boolean;
-  voiceActive: boolean;
 };
 
 export class InputController {
@@ -18,24 +29,18 @@ export class InputController {
     mvy: 0,
     mouseX: 0,
     mouseY: 0,
-    flashlight: false,
-    interact: false,
-    drop: false,
     selectedSlot: 0,
-    chatOpen: false,
-    terminalOpen: false,
     voiceActive: false,
   };
   private down = new Set<string>();
-  private edge = {
-    interact: false,
-    drop: false,
+  private uiEdges: UiEdges = {
     chatToggle: false,
     terminalToggle: false,
     flashlightToggle: false,
     voicePressed: false,
     voiceReleased: false,
   };
+  private netEdges: NetEdges = { interact: false, drop: false };
   private canvas: HTMLCanvasElement | null = null;
   private uiHasFocus = () => false;
 
@@ -47,7 +52,6 @@ export class InputController {
     canvas.addEventListener("mousemove", this.onMouseMove);
     canvas.addEventListener("contextmenu", (e) => e.preventDefault());
     canvas.addEventListener("mousedown", this.onMouseDown);
-    canvas.addEventListener("mouseup", this.onMouseUp);
   }
 
   detach(): void {
@@ -56,7 +60,6 @@ export class InputController {
     if (this.canvas) {
       this.canvas.removeEventListener("mousemove", this.onMouseMove);
       this.canvas.removeEventListener("mousedown", this.onMouseDown);
-      this.canvas.removeEventListener("mouseup", this.onMouseUp);
     }
   }
 
@@ -67,16 +70,13 @@ export class InputController {
   };
 
   private onMouseDown = (e: MouseEvent) => {
-    if (e.button === 0) this.edge.interact = true;
-  };
-  private onMouseUp = (_e: MouseEvent) => {
-    /* no-op for now */
+    if (this.uiHasFocus()) return;
+    if (e.button === 0) this.netEdges.interact = true;
   };
 
   private onKey = (e: KeyboardEvent) => {
     if (this.uiHasFocus()) return;
-    const k = e.key;
-    const lower = k.toLowerCase();
+    const lower = e.key.toLowerCase();
     if (this.down.has(lower)) return;
     this.down.add(lower);
     switch (lower) {
@@ -91,26 +91,26 @@ export class InputController {
         this.recomputeMove();
         break;
       case "e":
-        this.edge.interact = true;
+        this.netEdges.interact = true;
         break;
       case "g":
-        this.edge.drop = true;
+        this.netEdges.drop = true;
         break;
       case "f":
-        this.edge.flashlightToggle = true;
+        this.uiEdges.flashlightToggle = true;
         break;
       case "v":
         if (!this.state.voiceActive) {
           this.state.voiceActive = true;
-          this.edge.voicePressed = true;
+          this.uiEdges.voicePressed = true;
         }
         break;
       case "enter":
-        this.edge.chatToggle = true;
+        this.uiEdges.chatToggle = true;
         break;
       case "tab":
         e.preventDefault();
-        this.edge.terminalToggle = true;
+        this.uiEdges.terminalToggle = true;
         break;
       case "1":
       case "2":
@@ -138,7 +138,7 @@ export class InputController {
       case "v":
         if (this.state.voiceActive) {
           this.state.voiceActive = false;
-          this.edge.voiceReleased = true;
+          this.uiEdges.voiceReleased = true;
         }
         break;
     }
@@ -159,20 +159,32 @@ export class InputController {
     this.state.mvy = my;
   }
 
-  // Returns and clears all edge events
-  consumeEdges() {
-    const out = { ...this.edge };
-    this.edge.interact = false;
-    this.edge.drop = false;
-    this.edge.chatToggle = false;
-    this.edge.terminalToggle = false;
-    this.edge.flashlightToggle = false;
-    this.edge.voicePressed = false;
-    this.edge.voiceReleased = false;
+  // UI edges drain every frame (toggles, holds)
+  consumeUiEdges(): UiEdges {
+    const out = { ...this.uiEdges };
+    this.uiEdges.chatToggle = false;
+    this.uiEdges.terminalToggle = false;
+    this.uiEdges.flashlightToggle = false;
+    this.uiEdges.voicePressed = false;
+    this.uiEdges.voiceReleased = false;
+    return out;
+  }
+
+  // Net edges drain only when input is transmitted, so they can never be lost
+  // on a frame where we don't send.
+  consumeNetEdges(): NetEdges {
+    const out = { ...this.netEdges };
+    this.netEdges.interact = false;
+    this.netEdges.drop = false;
     return out;
   }
 
   forceRefocus(): void {
-    this.recomputeMove();
+    if (this.uiHasFocus()) {
+      this.state.mvx = 0;
+      this.state.mvy = 0;
+    } else {
+      this.recomputeMove();
+    }
   }
 }
