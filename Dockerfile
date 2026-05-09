@@ -11,9 +11,6 @@ RUN npm install --workspaces --include-workspace-root --no-audit --no-fund
 FROM node:20-alpine AS build
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
-COPY --from=deps /app/shared/node_modules ./shared/node_modules
-COPY --from=deps /app/server/node_modules ./server/node_modules
-COPY --from=deps /app/client/node_modules ./client/node_modules
 COPY package.json package-lock.json* tsconfig.base.json tsconfig.json ./
 COPY shared/package.json shared/tsconfig.json ./shared/
 COPY shared/src ./shared/src
